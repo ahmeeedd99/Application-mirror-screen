@@ -1,7 +1,7 @@
 # ipad-main-display
 
 Plug your iPad into the Mac with USB-C and it becomes the **main display**, automatically.
-Built on Apple's own Sidecar plus ~300 lines of code in this repo. No third-party apps, no downloads.
+Built on Apple's own Sidecar plus ~350 lines of code in this repo. No third-party apps, no downloads.
 
 ## Setup (once, while you can still see the Mac, e.g. over HDMI)
 
