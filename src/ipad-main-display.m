@@ -4,33 +4,46 @@
 // (Apple's built-in iPad-as-display feature) and make the iPad the MAIN display.
 // No clicking, no need to see the Mac's screen.
 //
-// Build:
+// Build (install.sh does this for you):
 //   clang -fobjc-arc -O2 -Wall -framework Foundation -framework CoreGraphics \
 //         -framework IOKit -o ipad-main-display ipad-main-display.m
 //
 // Usage:
 //   ipad-main-display [run] [--name "My iPad"] [--any-transport]   run forever (what launchd does)
-//   ipad-main-display once   [--name ...]                          connect once, then exit 0
+//   ipad-main-display once  [--name ...]                           connect once, then exit 0
+//   ipad-main-display list                                         print Sidecar device names
 //   ipad-main-display doctor                                       print diagnostics
 //
-// Sidecar has no public API, so this talks to Apple's private SidecarCore
-// framework through the Objective-C runtime. Every call is checked with
-// respondsToSelector:, so if a macOS update renames something we log it
-// (run `doctor`) instead of crashing.
+// Safety properties (see README "Security"):
+//   * runs as the logged-in user, refuses to run as root
+//   * makes no network connections, spawns no processes, writes no files
+//   * only ever asks Sidecar to connect to ONE device: the pinned/only one, never a guess
+//   * only acts while an Apple "iPad" is on the USB bus (unless --any-transport)
+//   * Sidecar has no public API: it is reached through the Objective-C runtime in
+//     Apple's private SidecarCore framework, loaded from its absolute system path.
+//     Every call is guarded with respondsToSelector:, so a macOS update that renames
+//     something produces a log line (run `doctor`), not a crash.
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <IOKit/IOKitLib.h>
 #import <objc/runtime.h>
 #import <dlfcn.h>
+#import <unistd.h>
+#import <sys/stat.h>
 
 #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
 
-#define APPLE_USB_VENDOR 0x05AC
+#define APPLE_USB_VENDOR   0x05AC
+#define TICK_SECONDS       2
+#define CONNECT_TIMEOUT    45
+#define REARRANGE_MIN_GAP  30
+#define LOG_MAX_BYTES      (512 * 1024)
 
-static NSString *gWantedName = nil;      // optional: only connect to a device whose name contains this
-static BOOL gRequireUSB = YES;           // only act when an iPad is on the USB bus
-static BOOL gExitAfterConnect = NO;      // `once` mode
+static NSString *gWantedName = nil;   // optional pin: exact name, or unique substring
+static BOOL gRequireUSB = YES;        // only act when an iPad is on the USB bus
+static BOOL gExitAfterConnect = NO;   // `once` mode
+static id gActivity = nil;            // keeps macOS from App-Napping our timer
 
 // ---------------------------------------------------------------- Sidecar
 
@@ -66,15 +79,29 @@ static NSString *DeviceName(id d) {
     return [n isKindOfClass:[NSString class]] ? n : [d description];
 }
 
-static BOOL NameMatches(NSString *name) {
-    if (gWantedName.length == 0) return YES;
-    return [name rangeOfString:gWantedName options:NSCaseInsensitiveSearch].location != NSNotFound;
-}
+// Pick exactly one device, or none. Never guess between several.
+// `why` receives a human-readable reason when nothing is returned.
+static id FindDevice(NSString **why) {
+    NSArray *devs = SidecarArray(@"devices");
+    if (devs.count == 0) { *why = @"Sidecar lists no devices yet"; return nil; }
 
-static id FindDevice(void) {
-    for (id d in SidecarArray(@"devices")) {
-        if (NameMatches(DeviceName(d))) return d;
+    if (gWantedName.length == 0) {
+        if (devs.count == 1) return devs[0];
+        *why = [NSString stringWithFormat:@"%lu Sidecar devices are available and none is pinned. Re-run ./install.sh \"<iPad name>\" so I know which one to use.",
+                (unsigned long)devs.count];
+        return nil;
     }
+    for (id d in devs) {
+        if ([DeviceName(d) caseInsensitiveCompare:gWantedName] == NSOrderedSame) return d;
+    }
+    NSMutableArray *partial = [NSMutableArray array];
+    for (id d in devs) {
+        if ([DeviceName(d) rangeOfString:gWantedName options:NSCaseInsensitiveSearch].location != NSNotFound) [partial addObject:d];
+    }
+    if (partial.count == 1) return partial[0];
+    *why = partial.count == 0
+        ? [NSString stringWithFormat:@"no Sidecar device is named \"%@\" (yet)", gWantedName]
+        : [NSString stringWithFormat:@"\"%@\" matches %lu devices; use a more exact name", gWantedName, (unsigned long)partial.count];
     return nil;
 }
 
@@ -88,7 +115,7 @@ static BOOL IsConnected(id device) {
 
 // ------------------------------------------------------------------- USB
 
-// YES when something named "iPad" made by Apple is on the USB bus.
+// YES when an Apple device whose USB product name contains "iPad" is on the bus.
 static BOOL IPadOnUSB(void) {
     io_iterator_t it = 0;
     if (IOServiceGetMatchingServices(0, IOServiceMatching("IOUSBHostDevice"), &it) != KERN_SUCCESS) return NO;
@@ -120,7 +147,7 @@ static NSArray<NSNumber *> *OnlineDisplays(void) {
     return a;
 }
 
-static NSSet<NSNumber *> *gBaseline = nil;           // displays that existed before we connected
+static NSSet<NSNumber *> *gBaseline = nil;     // displays that existed before we connected
 static CGDirectDisplayID gIPadDisplay = kCGNullDirectDisplay;
 static NSDate *gLastArrange = nil;
 
@@ -132,8 +159,7 @@ static CGDirectDisplayID FindIPadDisplay(void) {
 
     NSMutableArray *added = [NSMutableArray array], *external = [NSMutableArray array];
     for (NSNumber *n in online) {
-        CGDirectDisplayID d = n.unsignedIntValue;
-        if (CGDisplayIsBuiltin(d)) continue;
+        if (CGDisplayIsBuiltin(n.unsignedIntValue)) continue;
         [external addObject:n];
         if (gBaseline && ![gBaseline containsObject:n]) [added addObject:n];
     }
@@ -142,27 +168,35 @@ static CGDirectDisplayID FindIPadDisplay(void) {
     return gIPadDisplay;
 }
 
-// Make `ipad` the main display (origin 0,0, menu bar + Dock) and park the rest to its right.
-static void MakeMain(CGDirectDisplayID ipad) {
-    if (CGMainDisplayID() == ipad) return;
-    if (gLastArrange && [[NSDate date] timeIntervalSinceDate:gLastArrange] < 10) return;  // don't thrash
-    gLastArrange = [NSDate date];
-
+// One attempt to put `ipad` at the origin (= main display). Other displays are parked either
+// diagonally at the iPad's corner (so the mouse cannot slide onto a dead panel) or, as a
+// fallback, simply to its right.
+static BOOL ApplyArrangement(CGDirectDisplayID ipad, BOOL cornerPark) {
     CGDisplayConfigRef cfg = NULL;
-    if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess) { NSLog(@"WARN: CGBeginDisplayConfiguration failed"); return; }
+    if (CGBeginDisplayConfiguration(&cfg) != kCGErrorSuccess) return NO;
     if (CGDisplayIsInMirrorSet(ipad)) CGConfigureDisplayMirrorOfDisplay(cfg, ipad, kCGNullDirectDisplay);
     CGConfigureDisplayOrigin(cfg, ipad, 0, 0);
-    CGFloat x = CGDisplayBounds(ipad).size.width;
+
+    CGRect ib = CGDisplayBounds(ipad);
+    int32_t x = (int32_t)ib.size.width;
+    int32_t y = cornerPark ? (int32_t)ib.size.height : 0;
     for (NSNumber *n in OnlineDisplays()) {
         CGDirectDisplayID d = n.unsignedIntValue;
         if (d == ipad) continue;
-        if (CGDisplayIsInMirrorSet(d) && CGDisplayMirrorsDisplay(d) == ipad) continue;
-        CGConfigureDisplayOrigin(cfg, d, (int32_t)x, 0);
-        x += CGDisplayBounds(d).size.width;
+        CGConfigureDisplayOrigin(cfg, d, x, y);
+        x += (int32_t)CGDisplayBounds(d).size.width;
     }
     CGError e = CGCompleteDisplayConfiguration(cfg, kCGConfigureForSession);
-    if (e != kCGErrorSuccess) { CGCancelDisplayConfiguration(cfg); NSLog(@"WARN: could not rearrange displays (error %d)", e); }
-    else NSLog(@"iPad display %u is now the main display", ipad);
+    if (e != kCGErrorSuccess) { CGCancelDisplayConfiguration(cfg); return NO; }
+    return CGMainDisplayID() == ipad;
+}
+
+static void MakeMain(CGDirectDisplayID ipad) {
+    if (CGMainDisplayID() == ipad) return;
+    if (gLastArrange && [[NSDate date] timeIntervalSinceDate:gLastArrange] < REARRANGE_MIN_GAP) return;
+    gLastArrange = [NSDate date];
+    if (ApplyArrangement(ipad, YES) || ApplyArrangement(ipad, NO)) NSLog(@"iPad display %u is now the main display", ipad);
+    else NSLog(@"WARN: could not make display %u the main display; will retry", ipad);
 }
 
 // ----------------------------------------------------------- State loop
@@ -172,11 +206,20 @@ static NSDate *gConnectStarted = nil;
 static NSDate *gNextAttempt = nil;
 static NSTimeInterval gBackoff = 3;
 static NSString *gLastStatus = nil;
+static unsigned gTicks = 0;
 
 static void Status(NSString *s) {            // log only when the state changes
     if ([s isEqualToString:gLastStatus]) return;
     gLastStatus = s;
     NSLog(@"%@", s);
+}
+
+// launchd opens our log file; keep it from growing forever.
+static void TrimLog(void) {
+    struct stat st;
+    if (fstat(STDERR_FILENO, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > LOG_MAX_BYTES) {
+        if (ftruncate(STDERR_FILENO, 0) == 0) NSLog(@"(log trimmed)");
+    }
 }
 
 static void Connect(id device) {
@@ -209,26 +252,30 @@ static void Connect(id device) {
 }
 
 static void Tick(void) {
+    if (++gTicks % 300 == 0) TrimLog();
+
     if (gConnecting) {
-        if ([[NSDate date] timeIntervalSinceDate:gConnectStarted] > 45) {
-            NSLog(@"Connect attempt hung for 45s, giving up on it");
+        if ([[NSDate date] timeIntervalSinceDate:gConnectStarted] > CONNECT_TIMEOUT) {
+            NSLog(@"Connect attempt hung for %ds, giving up on it", CONNECT_TIMEOUT);
             gConnecting = NO;
             gNextAttempt = [NSDate dateWithTimeIntervalSinceNow:gBackoff];
         }
         return;
     }
-    if (!SidecarManager()) { Status(@"ERROR: Sidecar not available, exiting so launchd restarts me"); exit(1); }
+    if (!SidecarManager()) { NSLog(@"ERROR: Sidecar not available; exiting so launchd restarts me"); exit(1); }
 
     if (gRequireUSB && !IPadOnUSB()) {
         gIPadDisplay = kCGNullDirectDisplay;
         gBackoff = 3;
+        gNextAttempt = nil;
         Status(@"Waiting for an iPad on USB");
         return;
     }
 
-    id dev = FindDevice();
+    NSString *why = nil;
+    id dev = FindDevice(&why);
     if (!dev) {
-        Status(@"iPad is plugged in but Sidecar does not list it yet. Unlock the iPad, tap Trust, and use the same Apple ID on both.");
+        Status([NSString stringWithFormat:@"iPad is plugged in but I cannot pick a Sidecar device: %@. (Unlock the iPad, tap Trust, same Apple ID on both.)", why]);
         return;
     }
 
@@ -247,7 +294,11 @@ static void Tick(void) {
     Connect(dev);
 }
 
-// --------------------------------------------------------------- Doctor
+// ------------------------------------------------------- list / doctor
+
+static void ListDevices(void) {
+    for (id d in SidecarArray(@"devices")) printf("%s\n", [DeviceName(d) UTF8String]);
+}
 
 static void Doctor(void) {
     printf("== SidecarCore ==\n");
@@ -267,8 +318,8 @@ static void Doctor(void) {
     for (NSNumber *n in OnlineDisplays()) {
         CGDirectDisplayID d = n.unsignedIntValue;
         CGRect b = CGDisplayBounds(d);
-        printf("id %u builtin=%d main=%d bounds=%.0fx%.0f@(%.0f,%.0f)\n", d, CGDisplayIsBuiltin(d),
-               CGMainDisplayID() == d, b.size.width, b.size.height, b.origin.x, b.origin.y);
+        printf("id %u builtin=%d main=%d bounds=%.0fx%.0f@(%.0f,%.0f)\n", d, CGDisplayIsBuiltin(d) ? 1 : 0,
+               CGMainDisplayID() == d ? 1 : 0, b.size.width, b.size.height, b.origin.x, b.origin.y);
     }
 }
 
@@ -276,19 +327,28 @@ static void Doctor(void) {
 
 int main(int argc, const char **argv) {
     @autoreleasepool {
-        BOOL doctor = NO;
+        if (geteuid() == 0) { fprintf(stderr, "Refusing to run as root. Run as your normal user.\n"); return 1; }
+
+        BOOL doctor = NO, list = NO;
         for (int i = 1; i < argc; i++) {
             NSString *a = @(argv[i]);
             if ([a isEqualToString:@"doctor"]) doctor = YES;
+            else if ([a isEqualToString:@"list"]) list = YES;
             else if ([a isEqualToString:@"once"]) gExitAfterConnect = YES;
+            else if ([a isEqualToString:@"run"]) { /* default */ }
             else if ([a isEqualToString:@"--any-transport"]) gRequireUSB = NO;
             else if ([a isEqualToString:@"--name"] && i + 1 < argc) gWantedName = @(argv[++i]);
+            else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); return 2; }
         }
         if (doctor) { Doctor(); return 0; }
+        if (list) { ListDevices(); return 0; }
 
-        NSLog(@"ipad-main-display started (usb-only=%d, name=%@)", gRequireUSB, gWantedName ?: @"any");
+        NSLog(@"ipad-main-display started (usb-only=%d, name=%@)", gRequireUSB, gWantedName ?: @"(not pinned)");
+        TrimLog();
+        gActivity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiatedAllowingIdleSystemSleep
+                                                                    reason:@"Watching for iPad"];
         dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-        dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC, NSEC_PER_SEC / 2);
+        dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, TICK_SECONDS * NSEC_PER_SEC, NSEC_PER_SEC / 4);
         dispatch_source_set_event_handler(timer, ^{ Tick(); });
         dispatch_resume(timer);
         if (gExitAfterConnect) {
